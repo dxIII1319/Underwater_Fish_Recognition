@@ -7,18 +7,18 @@ from pathlib import Path
 import numpy as np
 from segmentation import load_segmentation_model
 from saliency import SaliencyPartInitializer
-
+# data_loader.py
 class FishDataset(Dataset):
     def __init__(self, root, annotation_path=None, transforms=None, is_target=False):
         self.root = root
         self.transforms = transforms
-        self.is_target = is_target
+        self.is_target = is_target  # <-- Add this flag
         
         # Paper 1 components
         self.saliency_init = SaliencyPartInitializer(num_parts=6)
         self.segmentor = load_segmentation_model()
         
-        if annotation_path:  # Source domain (labeled)
+        if annotation_path and not self.is_target:  # Source domain (labeled)
             self.coco = COCO(annotation_path)
             self.ids = list(sorted(self.coco.imgs.keys()))
         else:  # Target domain (unlabeled)
@@ -26,25 +26,26 @@ class FishDataset(Dataset):
 
     def __getitem__(self, idx):
         # Load image
-        if hasattr(self, 'coco'):  # Source domain
+        if not self.is_target:  # Source domain (labeled)
             img_id = self.ids[idx]
             img_info = self.coco.loadImgs(img_id)[0]
             img_path = f"{self.root}/images/{img_info['file_name']}"
-        else:  # Target domain
+        else:  # Target domain (unlabeled)
             img_path = f"{self.root}/{self.ids[idx]}.jpg"
-            
-        img = Image.open(img_path).convert("RGB")
-        img_np = np.array(img)  # Convert to numpy for segmentation
         
-        # Get bounding boxes (source domain only)
-        boxes = []
-        if hasattr(self, 'coco'):
+        img = Image.open(img_path).convert("RGB")
+        img_np = np.array(img)
+        
+        # Segmentation (GrabCut) - Handle target domain differently
+        if self.is_target:
+            # For target domain, assume full image as foreground (no boxes)
+            mask = self.segmentor.segment(img_np, boxes=None)
+        else:
+            # For source domain, use ground-truth boxes
             ann_ids = self.coco.getAnnIds(imgIds=img_id)
             anns = self.coco.loadAnns(ann_ids)
             boxes = [ann['bbox'] for ann in anns]
-        
-        # Segment using Paper 1's GrabCut method
-        mask = self.segmentor.segment(img_np, boxes if not self.is_target else None)
+            mask = self.segmentor.segment(img_np, boxes)
         
         # Saliency-based part initialization
         saliency_points = self.saliency_init(img_np, mask)
@@ -59,8 +60,8 @@ class FishDataset(Dataset):
             "mask": torch.from_numpy(mask).float()
         }
         
-        # Add annotations for source domain
-        if hasattr(self, 'coco'):
+        # Add annotations only for source domain
+        if not self.is_target:
             target["boxes"] = torch.tensor([ann['bbox'] for ann in anns], dtype=torch.float32)
             target["labels"] = torch.tensor([ann['category_id'] for ann in anns], dtype=torch.int64)
 
@@ -69,6 +70,3 @@ class FishDataset(Dataset):
             img = self.transforms(img)
 
         return img, target
-
-    def __len__(self):
-        return len(self.ids)
